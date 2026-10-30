@@ -1,8 +1,8 @@
 [project]
 name = "epub-colorizer"
 version = "1.0.0"
-description = "My EPUB Colorizer app"
-requires-python = ">=3.12"
+description = "EPUB Colorizer app"
+requires-python = ">=3.9"
 dependencies = [
     "flet>=0.28.0",
 ]
