@@ -4,23 +4,28 @@ on: workflow_dispatch
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: 1
+      FLET_CLI_NO_RICH_OUTPUT: 1
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build APK
-        id: build
-        uses: flet-dev/flet-build-action@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          target: apk
-          runner-python-version: "3.12"
-          bundled-python-version: "3.12"
-        env:
-          FLET_CLI_NO_RICH_OUTPUT: 1
-          UV_NO_PROGRESS: 1
+          python-version: "3.12"
+
+      - name: Install Flet and uv
+        run: |
+          pip install flet==0.28.0 uv
+
+      - name: Build APK
+        run: |
+          flet build apk --no-rich-output --verbose
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apk
+          name: epub-colorizer-apk
           path: build/apk/*.apk
           if-no-files-found: error
