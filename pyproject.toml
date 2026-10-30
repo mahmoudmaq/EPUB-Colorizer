@@ -1,1 +1,8 @@
+[project]
+name = "epub-colorizer"
+version = "1.0.0"
+description = "My EPUB Colorizer app"
 
+[tool.flet]
+product = "EPUB Colorizer"
+org = "com.mahmoud.epubcolorizer"
