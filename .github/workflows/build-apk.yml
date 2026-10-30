@@ -17,7 +17,7 @@ jobs:
 
       - name: Install Flet and uv
         run: |
-          pip install flet==0.28.0 uv
+          pip install flet==0.28.3 uv
 
       - name: Build APK
         run: |
