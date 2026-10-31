@@ -162,6 +162,12 @@ def deliver_file(src, dest):
     os.replace(tmp, dest)
 
 
+def is_private_copy(path):
+    """True when the path is an app-private temporary copy (Android/iOS picker)."""
+    p = (path or "").lower().replace(os.sep, "/")
+    return "/cache/" in p or "/caches/" in p or "/data/data/" in p or "/data/user/" in p
+
+
 def process_epub(input_path, out_path, opts, log, fallback):
     """Extract -> transform one HTML file at a time -> repack -> deliver.
 
@@ -218,33 +224,39 @@ def process_epub(input_path, out_path, opts, log, fallback):
                         continue
                     zout.write(os.path.join(root, fname), rel, compress_type=zipfile.ZIP_DEFLATED)
 
-        log("Saving to " + out_path + " ...")
+        private_copy = is_private_copy(input_path)
+        if not private_copy:
+            log("Saving next to the input file: " + out_path + " ...")
+            try:
+                deliver_file(produced, out_path)
+                log("Saved: " + out_path)
+                return {"path": out_path, "total": total, "changed": changed, "failed": failed}
+            except (PermissionError, OSError) as ex:
+                # Fall back to a save dialog - logged as a WARNING, not an error.
+                log("WARNING: cannot save to " + out_path + ": " + type(ex).__name__ + ": " + str(ex), warn=True)
+        else:
+            log("WARNING: the system handed the app a temporary copy of your book, so it cannot write beside the original.", warn=True)
+            log("Choose the folder your book lives in - the output is saved there.", warn=True)
+
+        log("Opening a save dialog - the output goes in the folder you pick.", warn=True)
+        chosen = None
         try:
-            deliver_file(produced, out_path)
-            log("Saved: " + out_path)
-            return {"path": out_path, "total": total, "changed": changed, "failed": failed}
-        except (PermissionError, OSError) as ex:
-            # Fall back to a save dialog - logged as a WARNING, not an error.
-            log("WARNING: cannot save to " + out_path + ": " + type(ex).__name__ + ": " + str(ex), warn=True)
-            log("Opening a save dialog - choose a folder for the output file.", warn=True)
-            chosen = None
-            try:
-                chosen = fallback(os.path.basename(out_path))
-            except Exception as ex2:
-                log("Save dialog failed: " + type(ex2).__name__ + ": " + str(ex2), warn=True)
-            if not chosen:
-                log("Save cancelled")
-                return None
-            if os.path.abspath(chosen) == os.path.abspath(input_path):
-                log("ERROR: refusing to overwrite the input file - pick another name.", error=True)
-                return None
-            try:
-                deliver_file(produced, chosen)
-                log("Saved: " + chosen)
-                return {"path": chosen, "total": total, "changed": changed, "failed": failed}
-            except Exception as ex3:
-                log("ERROR: save failed: " + type(ex3).__name__ + ": " + str(ex3), error=True)
-                return None
+            chosen = fallback(os.path.basename(out_path), None if private_copy else os.path.dirname(out_path))
+        except Exception as ex2:
+            log("Save dialog failed: " + type(ex2).__name__ + ": " + str(ex2), warn=True)
+        if not chosen:
+            log("Save cancelled")
+            return None
+        if os.path.abspath(chosen) == os.path.abspath(input_path):
+            log("ERROR: refusing to overwrite the input file - pick another name.", error=True)
+            return None
+        try:
+            deliver_file(produced, chosen)
+            log("Saved: " + chosen)
+            return {"path": chosen, "total": total, "changed": changed, "failed": failed}
+        except Exception as ex3:
+            log("ERROR: save failed: " + type(ex3).__name__ + ": " + str(ex3), error=True)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +304,7 @@ def run_self_test(log):
         del buf
 
         opts = build_test_opts()
-        res = process_epub(src, dst, opts, log, fallback=lambda default_name: None)
+        res = process_epub(src, dst, opts, log, fallback=lambda default_name, folder=None: None)
         if not res or res.get("path") != dst:
             return False, "pipeline did not save the output file"
 
@@ -646,6 +658,10 @@ def _start(page: ft.Page):
                 chosen_file_text.value = "Chosen: " + os.path.basename(path)
                 out_name_field.value = base + "_colored.epub"
                 log("Input: " + path)
+                if is_private_copy(path):
+                    log("Note: the picker gave the app a temporary copy, so the output goes to the folder you choose when saving.", warn=True)
+                else:
+                    log("Output folder: " + os.path.dirname(path) + " (same folder as the input file)")
             else:
                 log("File selection cancelled.")
             safe_update()
@@ -689,13 +705,28 @@ def _start(page: ft.Page):
         except Exception as ex:
             log("Could not register file pickers: " + type(ex).__name__ + ": " + str(ex), error=True)
 
-    def fallback_save_dialog(default_name):
-        """Ask the user where to save. Returns the path or None if cancelled."""
+    def fallback_save_dialog(default_name, folder=None):
+        """Ask the user where to save, starting in the input folder. Returns the path or None."""
         save_target["path"] = None
         ev = threading.Event()
         save_wait["event"] = ev
         try:
-            save_picker.save_file(dialog_title="Save colored EPUB as", file_name=default_name)
+            if folder:
+                save_picker.save_file(
+                    dialog_title="Save colored EPUB as",
+                    file_name=default_name,
+                    initial_directory=folder,
+                )
+            else:
+                save_picker.save_file(dialog_title="Save colored EPUB as", file_name=default_name)
+        except TypeError:
+            # Older flet builds have no initial_directory argument.
+            try:
+                save_picker.save_file(dialog_title="Save colored EPUB as", file_name=default_name)
+            except Exception as ex:
+                log("Save dialog could not open: " + type(ex).__name__ + ": " + str(ex), warn=True)
+                ev.set()
+                return None
         except Exception as ex:
             log("Save dialog could not open: " + type(ex).__name__ + ": " + str(ex), warn=True)
             ev.set()
