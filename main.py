@@ -30,6 +30,7 @@ MIMETYPE = "application/epub+zip"
 HTML_EXTS = (".xhtml", ".html", ".htm")
 HEARTBEAT_EVERY = 25
 HEX_RE = re.compile(r"#?([0-9a-fA-F]{6})")
+DECL_ENCODING_RE = re.compile(r'(encoding\s*=\s*["\'])([A-Za-z0-9_\-]+)(["\'])', re.IGNORECASE)
 
 PALETTE = [
     "#FFFFFF", "#C0C0C0", "#808080", "#404040", "#000000",
@@ -72,6 +73,34 @@ def fieldset_style(color):
         "background-color: rgba(0,229,255,0.06); "
         "padding: 12px 16px; border-radius: 8px; margin: 16px 0;"
     )
+
+
+def decode_html(raw):
+    """Decode one HTML file; returns (text, encoding to write it back with).
+
+    Modern EPUBs are UTF-8, but older books are often windows-1252 or
+    iso-8859-1. Those must not be skipped, so fall back to the declared
+    encoding and then to cp1252 instead of failing the file.
+    """
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig"), "utf-8-sig"
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    head = raw[:2048].decode("ascii", "ignore")
+    m = DECL_ENCODING_RE.search(head)
+    declared = m.group(2) if m else None
+    for enc in ([declared] if declared else []) + ["cp1252", "latin-1"]:
+        try:
+            text = raw.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+        # Keep the declaration honest so readers decode the file correctly.
+        if not declared or declared.lower() != enc.lower():
+            text = DECL_ENCODING_RE.sub(lambda mm: mm.group(1) + enc + mm.group(3), text, count=1)
+        return text, enc
+    return raw.decode("utf-8", "replace"), "utf-8"
 
 
 # ---------------------------------------------------------------------------
@@ -191,13 +220,13 @@ def is_private_copy(path):
 def fallback_save_dirs(input_path):
     """Folders the app can always write to, tried if the chosen one fails."""
     dirs = []
-    for d in (os.path.dirname(input_path), tempfile.gettempdir(), os.path.expanduser("~")):
+    for d in (os.path.expanduser("~"), os.path.dirname(input_path), tempfile.gettempdir()):
         if d and os.path.isdir(d) and d not in dirs:
             dirs.append(d)
     return dirs
 
 
-def process_epub(input_path, out_path, opts, log, fallback):
+def process_epub(input_path, out_path, opts, log, fallback, private_copy=None):
     """Extract -> transform one HTML file at a time -> repack -> deliver.
 
     Returns a dict with the final path and counters, or None if the user
@@ -221,12 +250,14 @@ def process_epub(input_path, out_path, opts, log, fallback):
                 total += 1
                 fpath = os.path.join(root, fname)
                 try:
-                    with open(fpath, "r", encoding="utf-8-sig") as f:
-                        original = f.read()
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    original, enc = decode_html(raw)
+                    del raw
                     recolored = transform_html(original, opts)
                     if recolored != original:
                         changed += 1
-                        with open(fpath, "w", encoding="utf-8") as f:
+                        with open(fpath, "w", encoding=enc, newline="") as f:
                             f.write(recolored)
                     del original, recolored
                 except Exception as ex:
@@ -253,7 +284,8 @@ def process_epub(input_path, out_path, opts, log, fallback):
                         continue
                     zout.write(os.path.join(root, fname), rel, compress_type=zipfile.ZIP_DEFLATED)
 
-        private_copy = is_private_copy(input_path)
+        if private_copy is None:
+            private_copy = is_private_copy(input_path)
         if not private_copy:
             log("Saving next to the input file: " + out_path + " ...")
             try:
@@ -273,29 +305,29 @@ def process_epub(input_path, out_path, opts, log, fallback):
             chosen = fallback(os.path.basename(out_path), None if private_copy else os.path.dirname(out_path))
         except Exception as ex2:
             log("Save dialog failed: " + type(ex2).__name__ + ": " + str(ex2), warn=True)
-        if not chosen:
-            log("Save cancelled")
-            return None
-        if os.path.abspath(chosen) == os.path.abspath(input_path):
-            log("ERROR: refusing to overwrite the input file - pick another name.", error=True)
-            return None
-        try:
-            deliver_file(produced, chosen)
-            log("Saved: " + chosen)
-            return {"path": chosen, "total": total, "changed": changed, "failed": failed}
-        except Exception as ex3:
-            log("WARNING: cannot save to " + chosen + ": " + type(ex3).__name__ + ": " + str(ex3), warn=True)
+        if chosen and os.path.abspath(chosen) == os.path.abspath(input_path):
+            log("WARNING: refusing to overwrite the input file - saving under a different name.", warn=True)
+            chosen = None
+        if chosen:
+            try:
+                deliver_file(produced, chosen)
+                log("Saved: " + chosen)
+                return {"path": chosen, "total": total, "changed": changed, "failed": failed}
+            except Exception as ex3:
+                log("WARNING: cannot save to " + chosen + ": " + type(ex3).__name__ + ": " + str(ex3), warn=True)
+        else:
+            log("WARNING: no save location was chosen, so the colored file is saved in the app's own storage instead.", warn=True)
 
-        # The chosen path was not writable (common with Android's document
-        # picker) - save somewhere the app always can, so nothing is lost.
-        name = os.path.basename(chosen) or os.path.basename(out_path)
+        # Never lose the work: fall back to a folder the app can always write.
+        name = os.path.basename(chosen) if chosen else os.path.basename(out_path)
         if not name.lower().endswith(".epub"):
             name += ".epub"
         for folder in fallback_save_dirs(input_path):
             try:
                 alt = os.path.join(folder, name)
                 deliver_file(produced, alt)
-                log("Saved to " + alt + " instead - pick another folder next time if you want it elsewhere.", warn=True)
+                log("Saved: " + alt)
+                log("To keep a copy in a browsable folder (e.g. Download), tap Color it again and pick that folder in the save dialog.", warn=True)
                 return {"path": alt, "total": total, "changed": changed, "failed": failed}
             except Exception as ex4:
                 log("WARNING: cannot save to " + folder + ": " + type(ex4).__name__ + ": " + str(ex4), warn=True)
@@ -318,6 +350,15 @@ TEST_HTML = (
     "</body></html>\n"
 )
 
+# An older, non-UTF-8 chapter: cp1252 bytes declared as iso-8859-1.
+TEST_LEGACY_HTML = (
+    '<?xml version="1.0" encoding="iso-8859-1"?>\n'
+    "<html><body>"
+    "<p>[Système: Éveil]</p>"
+    "<p>Alice et Zoé</p>"
+    "</body></html>\n"
+)
+
 
 def build_test_opts():
     return {
@@ -328,6 +369,7 @@ def build_test_opts():
         "names": [
             {"name": "Alice", "color": "#FF4444"},
             {"name": "Bob", "color": "#44CC44"},
+            {"name": "Zoé", "color": "#EC407A"},
         ],
     }
 
@@ -343,18 +385,20 @@ def run_self_test(log):
             zf.writestr("mimetype", MIMETYPE, compress_type=zipfile.ZIP_STORED)
             zf.writestr("OEBPS/content.xhtml", TEST_HTML, compress_type=zipfile.ZIP_DEFLATED)
             zf.writestr("OEBPS/style.css", "body{}", compress_type=zipfile.ZIP_DEFLATED)
+            zf.writestr("OEBPS/legacy.xhtml", TEST_LEGACY_HTML.encode("cp1252"), compress_type=zipfile.ZIP_DEFLATED)
         with open(src, "wb") as f:
             f.write(buf.getvalue())
         del buf
 
         opts = build_test_opts()
-        res = process_epub(src, dst, opts, log, fallback=lambda default_name, folder=None: None)
+        res = process_epub(src, dst, opts, log, fallback=lambda default_name, folder=None: None, private_copy=False)
         if not res or res.get("path") != dst:
             return False, "pipeline did not save the output file"
 
         with zipfile.ZipFile(dst) as zf:
             names = zf.namelist()
             content = zf.read("OEBPS/content.xhtml").decode("utf-8")
+            legacy = zf.read("OEBPS/legacy.xhtml").decode("iso-8859-1")
             mime_stored = zf.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
 
         checks = [
@@ -366,6 +410,8 @@ def run_self_test(log):
             ("titles colored", '<span style="color: #FFD700;">『Record of the Ancients』</span>' in content),
             ("Alice colored", '<span style="color: #FF4444;">Alice</span>' in content),
             ("Bob colored", '<span style="color: #44CC44;">Bob</span>' in content),
+            ("legacy iso-8859-1 file colored", '<span style="color: #00E5FF;">[Système: Éveil]</span>' in legacy),
+            ("legacy accents intact", '<span style="color: #EC407A;">Zoé</span>' in legacy),
         ]
         failed_names = [name for name, ok in checks if not ok]
         if failed_names:
