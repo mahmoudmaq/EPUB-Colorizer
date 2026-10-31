@@ -151,21 +151,50 @@ def transform_html(text, opts):
 # ---------------------------------------------------------------------------
 
 def deliver_file(src, dest):
-    """Copy src to dest atomically (tmp file in the same folder + rename)."""
+    """Copy src to dest.
+
+    Written to a temp file and renamed where the folder allows it. Android's
+    save dialog hands back paths such as "/document/995" where only that exact
+    document is writable (its folder is not a real directory), so a failed
+    temp file falls back to writing straight to dest.
+    """
     tmp = dest + ".epubcolorizer.tmp"
-    with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+    try:
+        with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(1024 * 1024)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+        os.replace(tmp, dest)
+        return
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
         while True:
             chunk = fsrc.read(1024 * 1024)
             if not chunk:
                 break
             fdst.write(chunk)
-    os.replace(tmp, dest)
 
 
 def is_private_copy(path):
     """True when the path is an app-private temporary copy (Android/iOS picker)."""
     p = (path or "").lower().replace(os.sep, "/")
     return "/cache/" in p or "/caches/" in p or "/data/data/" in p or "/data/user/" in p
+
+
+def fallback_save_dirs(input_path):
+    """Folders the app can always write to, tried if the chosen one fails."""
+    dirs = []
+    for d in (os.path.dirname(input_path), tempfile.gettempdir(), os.path.expanduser("~")):
+        if d and os.path.isdir(d) and d not in dirs:
+            dirs.append(d)
+    return dirs
 
 
 def process_epub(input_path, out_path, opts, log, fallback):
@@ -255,8 +284,23 @@ def process_epub(input_path, out_path, opts, log, fallback):
             log("Saved: " + chosen)
             return {"path": chosen, "total": total, "changed": changed, "failed": failed}
         except Exception as ex3:
-            log("ERROR: save failed: " + type(ex3).__name__ + ": " + str(ex3), error=True)
-            return None
+            log("WARNING: cannot save to " + chosen + ": " + type(ex3).__name__ + ": " + str(ex3), warn=True)
+
+        # The chosen path was not writable (common with Android's document
+        # picker) - save somewhere the app always can, so nothing is lost.
+        name = os.path.basename(chosen) or os.path.basename(out_path)
+        if not name.lower().endswith(".epub"):
+            name += ".epub"
+        for folder in fallback_save_dirs(input_path):
+            try:
+                alt = os.path.join(folder, name)
+                deliver_file(produced, alt)
+                log("Saved to " + alt + " instead - pick another folder next time if you want it elsewhere.", warn=True)
+                return {"path": alt, "total": total, "changed": changed, "failed": failed}
+            except Exception as ex4:
+                log("WARNING: cannot save to " + folder + ": " + type(ex4).__name__ + ": " + str(ex4), warn=True)
+        log("ERROR: save failed: no writable folder was found.", error=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
